@@ -1,0 +1,29 @@
+{
+  "name": "upright",
+  "productName": "Upright",
+  "version": "1.0.0",
+  "description": "Analiza postawy siedzącej, zmęczenia i przerw z kamery – w pełni lokalnie.",
+  "main": "dist/main/main.js",
+  "author": "warpolek",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node build.mjs && electron ."
+  },
+  "devDependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "@types/node": "^26.6.4",
+    "electron": "^44.5.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "electron": true
+  }
+}
