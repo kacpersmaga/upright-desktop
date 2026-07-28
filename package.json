@@ -9,7 +9,9 @@
   "private": true,
   "scripts": {
     "build": "node build.mjs",
-    "start": "node build.mjs && electron ."
+    "start": "node build.mjs && electron .",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx --test test/*.test.ts"
   },
   "devDependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
