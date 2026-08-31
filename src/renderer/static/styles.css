@@ -1,0 +1,95 @@
+/* Upright – paleta neutralna: ciepłe szarości, jeden spokojny akcent, stonowane kolory stanu. */
+:root {
+  --bg: #f3f3f1;
+  --surface: #ffffff;
+  --ink: #1f2023;
+  --muted: #6b6d72;
+  --line: #e1e1de;
+  --spine: #4b5d70;
+  --brand: #2d6878;
+  --spine-soft: #e7e9ec;
+  --good: #4f8a63;
+  --warn: #a97f35;
+  --bad: #a95a4c;
+  --overlay-ink: #ffffff;
+  --radius-lg: 18px;
+  --radius-sm: 8px;
+  --font: system-ui, "Segoe UI Variable Text", "Segoe UI", "SF Pro Text", -apple-system, Ubuntu, sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151617;
+    --surface: #1d1e20;
+    --ink: #e6e6e4;
+    --muted: #94969b;
+    --line: #2d2e31;
+    --spine: #9aaabb;
+    --brand: #6fb0c0;
+    --spine-soft: #2a2d31;
+    --good: #82b593;
+    --warn: #cfae6b;
+    --bad: #d08c7f;
+    color-scheme: dark;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: 28px; line-height: 1.15; }
+h2 { font-size: 15px; color: var(--muted); font-weight: 600; }
+h3 { font-size: 16px; }
+p { margin: 0; }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--spine); outline-offset: 2px; }
+
+/* ——— Szkielet ——— */
+.shell { display: grid; grid-template-columns: 208px 1fr; height: 100vh; }
+.rail {
+  display: flex; flex-direction: column; gap: 24px;
+  padding: 22px 14px 18px; border-right: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 650; padding: 0 8px; }
+/* Znak Upright (kręgosłup ze strzałką) jako maska: kolor z motywu, ostry w każdym rozmiarze ekranu. */
+.brand-mark { width: 13px; height: 40px; flex: none; background: var(--brand); -webkit-mask: url(logo-mark.png) center / contain no-repeat; mask: url(logo-mark.png) center / contain no-repeat; }
+.rail ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.nav-btn {
+  width: 100%; display: flex; align-items: center; gap: 12px;
+  padding: 9px 10px; border: 0; border-radius: var(--radius-sm); background: none; cursor: pointer; text-align: left;
+  color: var(--muted);
+}
+.nav-btn:hover { color: var(--ink); background: var(--spine-soft); }
+.nav-btn[aria-current="page"] { color: var(--ink); background: var(--surface); box-shadow: inset 3px 0 0 var(--spine); }
+.nav-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; display: block; }
+.rail-foot { margin-top: auto; display: grid; gap: 10px; padding: 0 8px; }
+.rail-state { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.rail-state::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.rail-state[data-state="good"]::before { background: var(--good); }
+.rail-state[data-state="warn"]::before { background: var(--warn); }
+.rail-state[data-state="bad"]::before { background: var(--bad); }
+
+.view { overflow: auto; outline: none; }
+
+/* ——— Przyciski ——— */
+.btn {
+  border: 1px solid var(--line); background: var(--surface); border-radius: 999px;
+  padding: 8px 16px; cursor: pointer; font-weight: 550; justify-self: start;
+}
+.btn:hover { border-color: var(--spine); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--spine); border-color: var(--spine); color: #fff; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.ghost { background: transparent; }
+.btn.small { padding: 5px 12px; font-size: 14px; }
+.btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.fine { color: var(--muted); font-size: 13.5px; }
+.lead { font-size: 16px; max-width: 70ch; }
