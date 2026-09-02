@@ -1,0 +1,627 @@
+// Analizator: kamera → MediaPipe (sylwetka + twarz) → metryki → ocena, zmęczenie, przerwy.
+import { FaceLandmarker, FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
+import { tr as trText } from '../shared/i18n';
+import type { BreakSuggestion, Calibration, FatigueSnapshot, IssueId, LiveStatus, MinuteSample, PostureMetrics, Settings, SlouchReference } from '../shared/types';
+import { computeMetrics, median, type Landmark } from '../core/metrics';
+import { PointSmoother } from '../core/oneEuro';
+import { PostureTracker, type TrackerOutput } from '../core/scoring';
+import { EyeAnalyzer, FatigueEstimator, type EyeDebug, LEFT_EYE, RIGHT_EYE, eyeAspectRatio, mouthAspectRatio, type FaceFrame } from '../core/fatigue';
+import { BreakEngine } from '../core/breakEngine';
+import { MinuteAggregator, postureAvg, postureSlope, topIssueOf } from '../core/aggregate';
+import { FrameGate } from '../core/frameGate';
+import { headPoseFromMatrix, type HeadPose } from '../core/headPose';
+import { ShoulderGate } from '../core/shoulderGate';
+import { BaselineDrift, checkCalibrationPose, followPositionRef, type CalibrationCheck } from '../core/calibration';
+import { energyPercent, minutesUntilLow, type EnergyPoint } from '../core/energy';
+
+export interface Frame {
+  t: number;
+  pose: Landmark[] | null;
+  face: Landmark[] | null;
+  metrics: PostureMetrics | null;
+  tracker: TrackerOutput | null;
+  fatigue: FatigueSnapshot | null;
+  reason?: string;
+  /** Diagnostyka oczu (podgląd pod klawiszem D). */
+  eyes?: EyeDebug;
+}
+
+interface AnalyzerCallbacks {
+  onFrame(f: Frame): void;
+  onStatus(s: LiveStatus): void;
+  onAlert(issue: IssueId): void;
+  onBreak(s: BreakSuggestion): void;
+  /** Wrócono po ≥ 2 min poza kadrem: liczymy to jak zrobioną przerwę ruchową. */
+  onAwayBreak(awaySec: number): void;
+  onMinute(s: MinuteSample): void;
+  onCameraState(state: 'starting' | 'running' | 'busy' | 'denied' | 'missing' | 'stopped', detail?: string): void;
+  /** camera: kamera/krzesło się zmieniły; straighter: siedzisz prościej niż przy kalibracji. */
+  onRecalibrateHint(kind: 'camera' | 'straighter'): void;
+}
+
+const POSE_INTERVAL_MS = 125; // ~8 analiz sylwetki na sekundę
+
+export class Analyzer {
+  video: HTMLVideoElement;
+  private pose: PoseLandmarker | null = null;
+  private face: FaceLandmarker | null = null;
+  private stream: MediaStream | null = null;
+  private timer: number | null = null;
+  private running = false;
+  private lastPoseMs = 0;
+  private lastTs = 0;
+  private lastPose: Landmark[] | null = null;
+  private lastMetrics: PostureMetrics | null = null;
+  private lastTracker: TrackerOutput | null = null;
+  private lastFatigue: FatigueSnapshot | null = null;
+  private lastStatusMs = 0;
+  private smoother = new PointSmoother();
+  private shoulderGate = new ShoulderGate();
+  /** Ostatnia twarz i ustawienie głowy (twarz liczymy co klatkę, sylwetkę rzadziej). */
+  private lastFace: Landmark[] | null = null;
+  private lastReason: string | undefined;
+  private lastHeadPose: HeadPose | null = null;
+  private tracker: PostureTracker | null = null;
+  private eyes = new EyeAnalyzer();
+  private fatigue = new FatigueEstimator();
+  /** Tryb prezentacji (tylko do zamknięcia aplikacji): od kiedy symulujemy zmęczenie, w sekundach analizatora. */
+  private presentationSince: number | null = null;
+  private breaks: BreakEngine;
+  private agg = new MinuteAggregator();
+  private recent: MinuteSample[] = [];
+  private faceScaleHist: number[] = [];
+  private recalHintDay = '';
+  private onBattery = false;
+  private retryTimer: number | null = null;
+  private calibrating: {
+    mode: 'tall' | 'slouch';
+    needSec: number;
+    goodSec: number;
+    lastT: number;
+    deadline: number;
+    samples: PostureMetrics[];
+    ears: number[];
+    onProgress?: (fraction: number, checks: CalibrationCheck[]) => void;
+    resolve: (c: Calibration | SlouchReference | null) => void;
+  } | null = null;
+  private drift: BaselineDrift | null = null;
+  private lastPositionT = 0;
+  /** Bateria z kolejnych minut (do prognozy). */
+  private energyHistory: EnergyPoint[] = [];
+  private driftHintDay = '';
+  demo = false;
+  /** Bez WebGL MediaPipe nie przyjmuje <video>: wtedy podajemy klatki jako ImageData. */
+  private cpuFrames = false;
+  private frameCanvas: OffscreenCanvas | null = null;
+  /** Analizujemy tylko nowe klatki – zatrzymane wideo nie może podbijać oceny starym obrazem. */
+  private gate = new FrameGate();
+
+  constructor(
+    private settings: Settings,
+    private calibration: Calibration | null,
+    private cb: AnalyzerCallbacks,
+  ) {
+    this.video = document.createElement('video');
+    this.video.muted = true;
+    this.video.playsInline = true;
+    this.breaks = new BreakEngine(settings, this.now());
+    if (calibration) this.setCalibration(calibration);
+    const nav = navigator as Navigator & { getBattery?: () => Promise<{ charging: boolean; addEventListener(e: string, f: () => void): void }> };
+    nav.getBattery?.().then((b) => {
+      this.onBattery = !b.charging;
+      b.addEventListener('chargingchange', () => (this.onBattery = !b.charging));
+    }).catch(() => undefined);
+  }
+
+  private now(): number {
+    return performance.now() / 1000;
+  }
+
+  async loadModels(): Promise<void> {
+    if (this.demo) return;
+    const fileset = await FilesetResolver.forVisionTasks('app://local/wasm');
+    const makePose = (delegate: 'GPU' | 'CPU', file: string) =>
+      PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: `app://local/models/${file}`, delegate },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+        // Wyższe progi: lepiej chwilę nie mieć barków niż wliczać zgadywane.
+        minPoseDetectionConfidence: 0.6,
+        minPosePresenceConfidence: 0.6,
+        minTrackingConfidence: 0.6,
+      });
+    const make = async (delegate: 'GPU' | 'CPU') => {
+      try {
+        // Model „full” trzyma barki i uszy stabilniej niż „lite”.
+        this.pose = await makePose(delegate, 'pose_landmarker_full.task');
+      } catch (e) {
+        if (delegate === 'GPU' && /kGpuService|webgl/i.test((e as Error).message)) throw e;
+        console.warn('Brak modelu full, używam lite:', (e as Error).message);
+        this.pose = await makePose(delegate, 'pose_landmarker_lite.task');
+      }
+      this.face = await FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: 'app://local/models/face_landmarker.task', delegate },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+        // Macierz ustawienia głowy: pochylenie/obrót/przechył w stopniach.
+        outputFacialTransformationMatrixes: true,
+      });
+    };
+    try {
+      await make('GPU');
+      console.info('Modele wczytane (GPU)');
+    } catch (e) {
+      console.warn('GPU niedostępne, przełączam na CPU:', (e as Error).message);
+      await make('CPU'); // brak WebGL – wolniej, ale działa
+      this.cpuFrames = true;
+      console.info('Modele wczytane (CPU)');
+    }
+  }
+
+  setSettings(s: Settings): void {
+    const cameraChanged = s.cameraId !== this.settings.cameraId;
+    this.settings = s;
+    this.tracker?.setConfig(s);
+    this.breaks.setConfig(s);
+    if (cameraChanged && this.running) {
+      this.stop();
+      void this.start();
+    }
+  }
+
+  setCalibration(c: Calibration): void {
+    this.calibration = c;
+    if (this.tracker) this.tracker.setCalibration(c);
+    else this.tracker = new PostureTracker(c, this.settings);
+    this.eyes.setCalibratedEarOpen(c.earOpen);
+    this.eyes.setCalibratedPitch(c.headPitchDeg ?? null);
+    this.faceScaleHist = [];
+    if (this.drift) this.drift.reset(c.neckRatio);
+    else this.drift = new BaselineDrift(c.neckRatio);
+  }
+
+  get hasCalibration(): boolean {
+    return this.calibration !== null;
+  }
+
+  get presentationMode(): boolean {
+    return this.presentationSince !== null;
+  }
+
+  /** Tryb prezentacji: włącza/wyłącza symulację zmęczenia (wynik oznaczony „SYMULACJA”, bez zapisu do bazy). */
+  setPresentationMode(on: boolean): void {
+    this.presentationSince = on ? this.now() : null;
+    this.fatigue.reset();
+  }
+
+  get breakEngine(): BreakEngine {
+    return this.breaks;
+  }
+
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.cb.onCameraState('starting');
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    if (!this.demo) {
+      try {
+        this.stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            deviceId: this.settings.cameraId ? { exact: this.settings.cameraId } : undefined,
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 30 },
+          },
+          audio: false,
+        });
+      } catch (e) {
+        const name = (e as DOMException).name;
+        if (name === 'NotReadableError' || name === 'AbortError') {
+          // Kamera zajęta (np. Teams, Zoom): pauza i ponowna próba co 30 s.
+          this.cb.onCameraState('busy');
+          this.retryTimer = window.setTimeout(() => void this.start(), 30000);
+        } else if (name === 'NotAllowedError') this.cb.onCameraState('denied');
+        else this.cb.onCameraState('missing', (e as Error).message);
+        return;
+      }
+      this.video.srcObject = this.stream;
+      this.gate.reset();
+      await this.video.play().catch((e) => console.warn('Kamera: play() odrzucone:', (e as Error).name, (e as Error).message));
+      this.stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        this.stop();
+        this.cb.onCameraState('busy');
+        this.retryTimer = window.setTimeout(() => void this.start(), 30000);
+      });
+    }
+    this.running = true;
+    this.cb.onCameraState('running');
+    this.loop();
+  }
+
+  /** Zatrzymuje analizę i zwalnia kamerę (np. pauza albo spotkanie). */
+  stop(): void {
+    this.running = false;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    this.video.srcObject = null;
+    const s = this.agg.flush();
+    if (s) this.emitMinute(s);
+    this.cb.onCameraState('stopped');
+  }
+
+  stopRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  get isRunning(): boolean {
+    return this.running;
+  }
+
+  /**
+   * Krok 1 kalibracji: wzorzec prostej postawy. Liczą się tylko chwile, w których kontrola
+   * na żywo nie ma zastrzeżeń (głowa uniesiona, barki i głowa poziomo, twarz przodem) –
+   * `onProgress` dostaje postęp i listę rzeczy do poprawy. Po 40 s bez wyniku: null.
+   */
+  calibrate(sec = 5, onProgress?: (fraction: number, checks: CalibrationCheck[]) => void): Promise<Calibration | null> {
+    return new Promise((resolve) => {
+      const t = this.now();
+      this.calibrating = {
+        mode: 'tall', needSec: sec, goodSec: 0, lastT: t, deadline: t + sec + 35,
+        samples: [], ears: [], onProgress, resolve: resolve as (c: unknown) => void,
+      };
+    });
+  }
+
+  /** Krok 2 kalibracji: zwykła pozycja przy pracy (osobisty zakres progów). */
+  captureSlouch(sec = 4, onProgress?: (fraction: number) => void): Promise<SlouchReference | null> {
+    return new Promise((resolve) => {
+      const t = this.now();
+      this.calibrating = {
+        mode: 'slouch', needSec: sec, goodSec: 0, lastT: t, deadline: t + sec + 15,
+        samples: [], ears: [], onProgress: onProgress ? (f) => onProgress(f) : undefined, resolve: resolve as (c: unknown) => void,
+      };
+    });
+  }
+
+  /** Ostatnie metryki (np. do kontroli postawy w czasie kalibracji). */
+  get currentMetrics(): PostureMetrics | null {
+    return this.lastMetrics;
+  }
+
+  /** Ostatnie punkty sylwetki (0–1) – do sprawdzania kadru i rysowania w kalibratorze. */
+  get currentPose(): Landmark[] | null {
+    return this.lastPose;
+  }
+
+  /** Ostatnie ustawienie głowy z modelu twarzy (null bez twarzy lub w trybie demo). */
+  get currentHeadPose(): HeadPose | null {
+    return this.lastHeadPose;
+  }
+
+  private loop = (): void => {
+    if (!this.running) return;
+    const started = performance.now();
+    try {
+      this.tick();
+    } catch (e) {
+      console.error((e as Error).stack ?? e);
+    }
+    // 30/s = pełne tempo kamery: przy 25/s najgłębszy moment szybkiego mrugnięcia (30–60 ms) często wypadał między klatkami.
+    const faceFps = !this.settings.faceAnalysis ? 8 : this.onBattery ? 15 : 30;
+    const wait = Math.max(5, 1000 / faceFps - (performance.now() - started));
+    this.timer = window.setTimeout(this.loop, wait);
+  };
+
+  private tick(): void {
+    const t = this.now();
+    let ms = Math.round(performance.now());
+    if (ms <= this.lastTs) ms = this.lastTs + 1;
+    this.lastTs = ms;
+    const w = this.video.videoWidth || 640;
+    const h = this.video.videoHeight || 480;
+    if (!this.demo && (this.video.readyState < 2 || !this.pose)) return;
+    if (!this.demo && !this.gate.isFresh(this.video)) {
+      // Brak nowej klatki (wideo wstrzymane, np. po odpięciu od DOM): nie analizujemy, wznawiamy odtwarzanie.
+      this.resumeVideoIfPaused();
+      if (ms - this.lastStatusMs > 500) {
+        this.lastStatusMs = ms;
+        this.cb.onStatus(this.status(t));
+      }
+      return;
+    }
+    const input = this.demo ? null : this.frameInput(w, h);
+
+    // Twarz: każda klatka (mrugnięcia trwają 100–400 ms).
+    let faceLm: Landmark[] | null = null;
+    if (this.settings.faceAnalysis) {
+      let ff: FaceFrame = { ear: null, blinkBlend: null, jawOpen: null };
+      if (this.demo) {
+        ff = demoFace(t);
+      } else if (this.face) {
+        const r = this.face.detectForVideo(input!, ms);
+        faceLm = (r.faceLandmarks?.[0] as Landmark[] | undefined) ?? null;
+        this.lastFace = faceLm;
+        this.lastHeadPose = faceLm ? headPoseFromMatrix(r.facialTransformationMatrixes?.[0]?.data) : null;
+        if (faceLm) {
+          const cats = r.faceBlendshapes?.[0]?.categories ?? [];
+          const bs = (n: string) => cats.find((c) => c.categoryName === n)?.score ?? null;
+          const bl = bs('eyeBlinkLeft');
+          const br = bs('eyeBlinkRight');
+          const jaw = bs('jawOpen');
+          ff = {
+            ear: (eyeAspectRatio(faceLm, LEFT_EYE, w, h) + eyeAspectRatio(faceLm, RIGHT_EYE, w, h)) / 2,
+            blinkBlend: bl !== null && br !== null ? (bl + br) / 2 : null,
+            jawOpen: jaw ?? Math.min(1, mouthAspectRatio(faceLm, w, h) * 1.2),
+            pitchDeg: this.lastHeadPose?.pitchDeg ?? null,
+          };
+        }
+      }
+      this.eyes.update(t, ff);
+      if (this.calibrating && ff.ear !== null) this.calibrating.ears.push(ff.ear);
+    }
+
+    // Sylwetka: ~8 razy na sekundę.
+    if (ms - this.lastPoseMs >= POSE_INTERVAL_MS || !this.settings.faceAnalysis) {
+      this.lastPoseMs = ms;
+      let lm: Landmark[] | undefined;
+      if (this.demo) lm = demoPose(t);
+      else lm = this.pose!.detectForVideo(input!, ms).landmarks?.[0] as Landmark[] | undefined;
+      this.lastPose = lm ?? null;
+      const res = computeMetrics(lm, w, h, t, {
+        smoother: this.smoother,
+        face: this.settings.faceAnalysis && !this.demo ? this.lastFace : null,
+        headPose: this.settings.faceAnalysis && !this.demo ? this.lastHeadPose : null,
+        shoulderGate: this.shoulderGate,
+      });
+      this.lastMetrics = res.metrics;
+      if (!res.metrics && res.reason === 'no-person') {
+        this.smoother.reset();
+        this.shoulderGate.reset();
+      }
+
+      if (this.calibrating) this.calibrationTick(t, res.metrics);
+
+      if (this.tracker) {
+        const out = this.tracker.update(t, res.metrics);
+        this.lastTracker = out;
+        if (res.metrics && this.calibration) {
+          this.eyes.updateHead(t, res.metrics.neckRatio / this.calibration.neckRatio);
+          this.trackFaceScale(res.metrics.eyeDistPx / this.calibration.eyeDistPx);
+          this.trackDrift(t, res.metrics);
+          followPositionRef(this.calibration, res.metrics, t - this.lastPositionT);
+          this.lastPositionT = t;
+        }
+        if (out.alert) {
+          this.breaks.registerAlert(t);
+          this.cb.onAlert(out.alert);
+        }
+        const avg15 = postureAvg(this.recent.slice(-15));
+        // Tryb prezentacji: symulowane zmęczenie narasta przez ~45 s od włączenia.
+        const sim = this.presentationSince === null ? undefined : Math.min(1, (t - this.presentationSince) / 45);
+        this.lastFatigue = this.fatigue.update(t, this.eyes, {
+          postureAvg15: avg15,
+          minutesSinceBreak: this.breaks.minutesSinceBreak(t),
+        }, sim);
+        const fat = this.lastFatigue;
+
+        const sug = this.breaks.update(t, {
+          present: out.present,
+          absentSec: out.absentSec,
+          fatiguePercent: fat?.percent ?? null,
+          postureSlope: postureSlope(this.recent.slice(-15)),
+          recentIssue: topIssueOf(this.recent.slice(-10)) ?? out.topIssue,
+        });
+        if (sug) this.cb.onBreak(sug);
+        const away = this.breaks.takeAwayBreak();
+        if (away?.kind === 'move') {
+          this.resetAfterBreak();
+          this.cb.onAwayBreak(away.awaySec);
+        }
+
+        const sample = this.agg.add(Date.now(), {
+          present: out.present,
+          score: out.score,
+          state: out.state,
+          severities: out.severities,
+          // Symulacja z trybu prezentacji nie trafia do bazy ani statystyk.
+          fatigue: fat?.simulated ? null : fat,
+        });
+        if (sample) this.emitMinute(sample);
+      }
+      this.lastReason = res.reason;
+    }
+
+    // Klatka dla nakładki w tempie twarzy (~25/s), nie sylwetki (~8/s): kontur powiek musi pokazać mrugnięcie.
+    this.cb.onFrame({
+      t,
+      pose: this.lastPose,
+      face: faceLm,
+      metrics: this.lastMetrics,
+      tracker: this.lastTracker,
+      fatigue: this.lastFatigue,
+      reason: this.lastReason,
+      eyes: this.settings.faceAnalysis ? this.eyes.debug(t) : undefined,
+    });
+
+    if (ms - this.lastStatusMs > 500) {
+      this.lastStatusMs = ms;
+      this.cb.onStatus(this.status(t));
+    }
+  }
+
+  /** Przeglądarka wstrzymuje <video> odpięte od dokumentu; dopóki analiza działa, wznawiamy je (co ~1 s). */
+  private resumeVideoIfPaused(): void {
+    if (!this.running || !this.video.paused || !this.video.srcObject) return;
+    if (this.gate.staleCount % 25 !== 1) return;
+    this.video.play().catch((e) => console.warn('Kamera: wznowienie play() nieudane:', (e as Error).name));
+  }
+
+  private frameInput(w: number, h: number): HTMLVideoElement | ImageData {
+    if (!this.cpuFrames) return this.video;
+    if (!this.frameCanvas || this.frameCanvas.width !== w || this.frameCanvas.height !== h) this.frameCanvas = new OffscreenCanvas(w, h);
+    const c = this.frameCanvas.getContext('2d', { willReadFrequently: true })!;
+    c.drawImage(this.video, 0, 0, w, h);
+    return c.getImageData(0, 0, w, h);
+  }
+
+  private energyNow(t: number): number | null {
+    const tr = this.lastTracker;
+    if (!this.calibration || !tr?.present) return null;
+    return energyPercent({
+      fatiguePercent: this.lastFatigue?.percent ?? null,
+      postureAvg15: postureAvg(this.recent.slice(-15)) ?? tr.score,
+      minutesSinceBreak: this.breaks.minutesSinceBreak(t),
+    });
+  }
+
+  status(t = this.now()): LiveStatus {
+    const tr = this.lastTracker;
+    const energy = this.energyNow(t);
+    return {
+      energy: energy === null ? null : { percent: energy, minutesToLow: minutesUntilLow(this.energyHistory) },
+      state: !this.calibration ? 'paused' : tr?.state ?? 'absent',
+      score: tr?.score ?? null,
+      fatigue: tr?.present ? this.lastFatigue : null,
+      topIssue: tr?.topIssue ?? null,
+      issues: tr?.issues ?? [],
+      minutesSinceBreak: Math.round(this.breaks.minutesSinceBreak(t)),
+      note: !this.calibration ? trText('Wymagana kalibracja') : undefined,
+    };
+  }
+
+  /** Przerwa zakończona przez użytkownika. */
+  breakDone(kind: BreakSuggestion['kind']): void {
+    const t = this.now();
+    this.breaks.done(kind, t);
+    if (kind !== 'eye') this.resetAfterBreak();
+  }
+
+  /** Po prawdziwej przerwie (klikniętej albo z odejścia od biurka) zmęczenie, trend Baterii i bezruch liczymy od nowa. */
+  private resetAfterBreak(): void {
+    this.energyHistory = [];
+    this.fatigue.reset();
+    this.tracker?.resetStillness();
+  }
+
+  breakSnoozed(): void {
+    this.breaks.snooze(this.now());
+  }
+
+  private emitMinute(s: MinuteSample): void {
+    this.recent.push(s);
+    if (this.recent.length > 30) this.recent.shift();
+    const e = this.energyNow(this.now());
+    if (e !== null) {
+      this.energyHistory.push({ min: s.ts / 60000, energy: e });
+      if (this.energyHistory.length > 60) this.energyHistory.shift();
+    }
+    this.cb.onMinute(s);
+  }
+
+  private trackFaceScale(scale: number): void {
+    this.faceScaleHist.push(scale);
+    if (this.faceScaleHist.length > 8 * 60 * 30) this.faceScaleHist.shift();
+    if (this.faceScaleHist.length < 8 * 60 * 30) return; // ~30 min danych
+    const med = median(this.faceScaleHist);
+    const day = new Date().toDateString();
+    if ((med > 1.3 || med < 0.75) && this.recalHintDay !== day) {
+      this.recalHintDay = day;
+      this.cb.onRecalibrateHint('camera');
+    }
+  }
+
+  private lastDriftCheck = 0;
+  private trackDrift(t: number, m: PostureMetrics): void {
+    if (!this.drift || this.calibrating) return;
+    this.drift.add(t, m);
+    if (t - this.lastDriftCheck < 60) return;
+    this.lastDriftCheck = t;
+    const day = new Date().toDateString();
+    if (this.driftHintDay !== day && this.drift.suggestsRecalibration()) {
+      this.driftHintDay = day;
+      this.cb.onRecalibrateHint('straighter');
+    }
+  }
+
+  private calibrationTick(t: number, m: PostureMetrics | null): void {
+    const c = this.calibrating!;
+    // Na wolnym komputerze analiza sylwetki bywa rzadka (nawet co 1 s) – nie ucinamy jej czasu za mocno.
+    const dt = Math.min(1, Math.max(0, t - c.lastT));
+    c.lastT = t;
+    if (m) {
+      const checks = c.mode === 'tall' ? checkCalibrationPose(m) : [];
+      if (checks.length === 0) {
+        c.samples.push(m);
+        c.goodSec += dt;
+      }
+      c.onProgress?.(Math.min(1, c.goodSec / c.needSec), checks);
+    }
+    const minSamples = c.mode === 'tall' ? 10 : 6;
+    // Na wolnym komputerze zbieramy dłużej, aż będzie dość próbek; po terminie kończymy z tym, co jest.
+    if ((c.goodSec >= c.needSec && c.samples.length >= minSamples) || t >= c.deadline) this.finishCalibration();
+  }
+
+  private finishCalibration(): void {
+    const c = this.calibrating!;
+    this.calibrating = null;
+    if (c.samples.length < (c.mode === 'tall' ? 10 : 6)) {
+      c.resolve(null);
+      return;
+    }
+    const pick = (k: 'neckRatio' | 'earRatio' | 'headRollDeg' | 'shoulderTiltDeg' | 'eyeDistPx' | 'shoulderToEye' | 'noseY') =>
+      median(c.samples.map((s) => s[k]));
+    const pitches = c.samples.map((m) => m.headPitchDeg).filter((x): x is number => x != null);
+    const headPitchDeg = pitches.length >= c.samples.length / 2 ? median(pitches) : null;
+    if (c.mode === 'slouch') {
+      c.resolve({ neckRatio: pick('neckRatio'), earRatio: pick('earRatio'), headPitchDeg });
+      return;
+    }
+    const shoulders = c.samples.map((m) => m.shoulderY).filter((x): x is number => x != null);
+    const cal: Calibration = {
+      createdAt: Date.now(),
+      neckRatio: pick('neckRatio'),
+      earRatio: pick('earRatio'),
+      headRollDeg: pick('headRollDeg'),
+      shoulderTiltDeg: pick('shoulderTiltDeg'),
+      eyeDistPx: pick('eyeDistPx'),
+      shoulderToEye: pick('shoulderToEye'),
+      earOpen: c.ears.length >= 30 ? median(c.ears) : null,
+      headPitchDeg,
+      noseY: pick('noseY'),
+      shoulderY: shoulders.length ? median(shoulders) : undefined,
+    };
+    this.setCalibration(cal);
+    c.resolve(cal);
+  }
+}
+
+// ——— Tryb demonstracyjny (bez kamery): syntetyczna sylwetka, przydatna do testów UI ———
+
+function demoPose(t: number): Landmark[] {
+  const lm: Landmark[] = Array.from({ length: 33 }, () => ({ x: 0, y: 0, visibility: 0.05 }));
+  const slouch = Math.max(0, Math.sin(t / 9)) * 0.07; // co jakiś czas się garbi
+  const sway = Math.sin(t / 2.3) * 0.004;
+  const set = (i: number, x: number, y: number) => (lm[i] = { x: x + sway, y, visibility: 0.98 });
+  const headY = 0.36 + slouch;
+  set(0, 0.5, headY + 0.06);
+  set(2, 0.545, headY);
+  set(5, 0.455, headY + slouch * 0.15);
+  set(7, 0.59, headY + 0.02);
+  set(8, 0.41, headY + 0.02);
+  set(11, 0.68, 0.74);
+  set(12, 0.32, 0.745 + slouch * 0.2);
+  set(23, 0.62, 1.05);
+  set(24, 0.38, 1.05);
+  return lm;
+}
+
+function demoFace(t: number): FaceFrame {
+  const phase = t % 3.7;
+  return { ear: phase < 0.15 ? 0.07 : 0.29, blinkBlend: null, jawOpen: 0.05 };
+}
