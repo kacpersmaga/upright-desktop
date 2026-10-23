@@ -10,22 +10,72 @@
   "scripts": {
     "build": "node build.mjs",
     "start": "node build.mjs && electron .",
+    "dev": "node build.mjs --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "dist": "node build.mjs --prod && electron-builder",
+    "dist:win": "node build.mjs --prod && electron-builder --win",
+    "dist:mac": "node build.mjs --prod && electron-builder --mac"
   },
   "devDependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
     "@types/node": "^26.6.4",
     "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
+  },
+  "build": {
+    "appId": "pl.upright.app",
+    "productName": "Upright",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets",
+        "to": "assets"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.healthcare-fitness",
+      "extendInfo": {
+        "NSCameraUsageDescription": "Upright analizuje postawę i mrugnięcia z obrazu kamery. Obraz nie opuszcza komputera i nie jest zapisywany."
+      }
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "npmRebuild": false
   },
   "engines": {
     "node": ">=22.13"
   },
   "allowScripts": {
     "esbuild": true,
-    "electron": true
+    "electron": true,
+    "electron-winstaller": true
   }
 }
