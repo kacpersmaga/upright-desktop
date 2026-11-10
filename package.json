@@ -15,7 +15,10 @@
     "test": "tsx --test test/*.test.ts",
     "dist": "node build.mjs --prod && electron-builder",
     "dist:win": "node build.mjs --prod && electron-builder --win",
-    "dist:mac": "node build.mjs --prod && electron-builder --mac"
+    "dist:mac": "node build.mjs --prod && electron-builder --mac",
+    "demo": "node build.mjs && electron . --demo --data=demo-data",
+    "seed-demo": "node scripts/seed-demo.mjs demo-data",
+    "demo:stats": "node build.mjs && electron . --demo --data=demo-data --view=stats"
   },
   "devDependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
