@@ -164,7 +164,7 @@ function postureTab(st: StatsPayload, range: RangeId, select: HTMLElement): HTML
     figs = h('div', { class: 'figs' },
       fig(pct(t.goodPercent), tr('dobra postawa'), delta(t.goodPercent, y?.goodPercent, true)),
       fig(t.avgPosture === null ? '–' : String(t.avgPosture), tr('średni wynik'), delta(t.avgPosture, y?.avgPosture, true)),
-      fig(String(t.alerts), 'alerty', null),
+      fig(String(t.alerts), tr('alerty'), null),
     );
     chart = hourChart(st, 'posture', goodPosture, '', tr('Postawa dziś, godzina po godzinie'));
   } else {
@@ -173,7 +173,7 @@ function postureTab(st: StatsPayload, range: RangeId, select: HTMLElement): HTML
     figs = h('div', { class: 'figs' },
       fig(pct(weighted(days, (d) => d.goodPercent)), tr('dobra postawa'), null),
       fig(avgScore === null ? '–' : String(avgScore), tr('średni wynik'), null),
-      fig(String(days.reduce((a, d) => a + d.alerts, 0)), 'alerty', null),
+      fig(String(days.reduce((a, d) => a + d.alerts, 0)), tr('alerty'), null),
     );
     chart = dayChart(days, (d) => d.goodPercent, goodPosture, '%', tr('Czas w dobrej postawie, {r}', { r: RANGES[range].toLowerCase() }));
   }

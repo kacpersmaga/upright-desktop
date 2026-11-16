@@ -336,6 +336,7 @@ export const EN: Record<string, string> = {
   '{d} względem wczoraj': '{d} vs yesterday',
   'przerwy · min. {n}': 'breaks · min. {n}',
   'przerwy': 'breaks',
+  'alerty': 'alerts',
   'Zalecane co najmniej {n} (5 min po każdej godzinie przy monitorze)': 'Recommended at least {n} (5 min after every hour at a screen)',
   'Dziś jeszcze brak pomiarów.': 'No measurements yet today.',
   'Brak pomiarów w tym okresie.': 'No measurements in this period.',
